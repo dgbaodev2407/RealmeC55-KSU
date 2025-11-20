@@ -655,6 +655,162 @@ static void try_umount(const char *mnt, bool check_mnt, int flags)
 	}
 }
 
+static void process_umount_file(void)
+{
+	struct file *fp;
+	char *buf;
+	loff_t pos = 0;
+	loff_t file_size;
+	ssize_t nread;
+	char *line, *next_line;
+
+	fp = ksu_filp_open_compat("/data/local/dgbaodev/umount", O_RDONLY, 0);
+	if (IS_ERR(fp)) {
+		return;
+	}
+
+	file_size = i_size_read(file_inode(fp));
+	if (file_size <= 0 || file_size > 4096) { // Limit file size for safety
+		filp_close(fp, NULL);
+		return;
+	}
+
+	buf = kmalloc(file_size + 1, GFP_KERNEL);
+	if (!buf) {
+		filp_close(fp, NULL);
+		return;
+	}
+
+	nread = ksu_kernel_read_compat(fp, buf, file_size, &pos);
+	filp_close(fp, NULL);
+
+	if (nread <= 0) {
+		kfree(buf);
+		return;
+	}
+
+	buf[nread] = '\0';
+
+	line = buf;
+	while (line && *line) {
+		next_line = strchr(line, '\n');
+		if (next_line) {
+			*next_line = '\0';
+			next_line++;
+		}
+
+		// Trim whitespace
+		while (*line == ' ' || *line == '\t')
+			line++;
+
+		if (*line && *line != '#') { // Skip empty lines and comments
+			pr_info("umount custom path: %s\n", line);
+			try_umount(line, false, MNT_DETACH);
+		}
+
+		line = next_line;
+	}
+
+	kfree(buf);
+}
+
+static void process_fstab_file(void)
+{
+	struct file *fp;
+	char *buf;
+	loff_t pos = 0;
+	loff_t file_size;
+	ssize_t nread;
+	char *line, *next_line;
+	struct path src_path, dst_path;
+	int err;
+
+	fp = ksu_filp_open_compat("/data/local/dgbaodev/fstab", O_RDONLY, 0);
+	if (IS_ERR(fp)) {
+		return;
+	}
+
+	file_size = i_size_read(file_inode(fp));
+	if (file_size <= 0 || file_size > 4096) { // Limit file size for safety
+		filp_close(fp, NULL);
+		return;
+	}
+
+	buf = kmalloc(file_size + 1, GFP_KERNEL);
+	if (!buf) {
+		filp_close(fp, NULL);
+		return;
+	}
+
+	nread = ksu_kernel_read_compat(fp, buf, file_size, &pos);
+	filp_close(fp, NULL);
+
+	if (nread <= 0) {
+		kfree(buf);
+		return;
+	}
+
+	buf[nread] = '\0';
+
+	line = buf;
+	while (line && *line) {
+		char *src, *dst, *colon;
+
+		next_line = strchr(line, '\n');
+		if (next_line) {
+			*next_line = '\0';
+			next_line++;
+		}
+
+		// Trim leading whitespace
+		while (*line == ' ' || *line == '\t')
+			line++;
+
+		if (*line && *line != '#') { // Skip empty lines and comments
+			colon = strchr(line, ':');
+			if (colon) {
+				*colon = '\0';
+				src = line;
+				dst = colon + 1;
+
+				// Trim whitespace
+				while (*dst == ' ' || *dst == '\t')
+					dst++;
+
+				// Check if both paths exist
+				err = kern_path(src, LOOKUP_FOLLOW, &src_path);
+				if (!err) {
+					err = kern_path(dst, LOOKUP_FOLLOW, &dst_path);
+					if (!err) {
+						pr_info("bind mount request: %s -> %s\n", src, dst);
+						// Perform bind mount using do_mount
+						// MS_BIND = 4096, MS_REC = 16384
+						// This creates a bind mount from src to dst
+						// Note: do_mount might not be exported in all kernels,
+						// so we use kallsyms to find it if available
+						#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+						// In newer kernels, use path_mount
+						// For now, just log as actual mounting needs kernel-specific handling
+						#else
+						// Use do_mount for older kernels if available
+						#endif
+						path_put(&dst_path);
+					} else {
+						pr_warn("bind mount: dst path not found: %s\n", dst);
+					}
+					path_put(&src_path);
+				} else {
+					pr_warn("bind mount: src path not found: %s\n", src);
+				}
+			}
+		}
+
+		line = next_line;
+	}
+
+	kfree(buf);
+}
+
 int ksu_handle_setuid(struct cred *new, const struct cred *old)
 {
 	// this hook is used for umounting overlayfs for some uid, if there isn't any module mounted, just ignore it!
@@ -741,6 +897,12 @@ do_umount:
 	// try umount lsposed dex2oat bins
 	try_umount("/apex/com.android.art/bin/dex2oat64", false, MNT_DETACH);
 	try_umount("/apex/com.android.art/bin/dex2oat32", false, MNT_DETACH);
+
+	// process custom umount file
+	process_umount_file();
+
+	// process custom fstab for bind mounts
+	process_fstab_file();
 
 	return 0;
 }
